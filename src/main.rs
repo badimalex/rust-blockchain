@@ -1,6 +1,9 @@
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fs::File, io::{self, BufReader, BufWriter, Write}, time::{SystemTime, UNIX_EPOCH}};
+use serde::{Serialize, Deserialize};
 
+
+#[derive(Serialize, Deserialize)]
 pub struct Block {
     pub index: u32,
     pub timestamp: u64,
@@ -9,6 +12,7 @@ pub struct Block {
     pub hash: String,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Blockchain {
     pub vec: Vec<Block>,
 }
@@ -82,19 +86,54 @@ fn current_time() -> u64 {
         .expect("Время до эпохи Unix!")
         .as_secs();
 
-    return timestamp;
+    timestamp
 }
 
 fn hash(input: &str) -> String {
     hex::encode(Sha256::digest(input.as_bytes()))
 }
 
+
+fn save_to_file(filepath: &str, chain: &Blockchain) -> io::Result<()> {
+
+     let file = File::create(filepath)?;
+    let mut writer = BufWriter::new(file);
+    // Сериализуем структуру и сразу пишем в файл
+    serde_json::to_writer_pretty(&mut writer, &chain)?;
+    writer.flush()?;
+
+    
+    Ok(())
+}
+
+fn load_from_file(filepath: &str,) -> Result<Blockchain, Box<dyn std::error::Error>> {
+    let file = File::open(filepath)?;
+    let reader = BufReader::new(file);
+
+    let chain: Blockchain = serde_json::from_reader(reader)?;
+
+    Ok(chain)
+}
+
 fn main() {
+    let file_path = "blockchain.json";
+
     let mut chain = Blockchain::new();
 
     chain.add_block(String::from("send 1 usd"));
     chain.add_block(String::from("send 2 usd"));
     chain.add_block(String::from("send 3 usd"));
 
-    println!("{}", chain.is_valid())
+    println!("chain: {}", chain.is_valid());
+
+    match save_to_file(file_path, &chain) {
+        Ok(_) => println!("chain saved: {}", file_path), 
+        Err(e) => println!("error: {}",e), 
+    }
+
+
+    match load_from_file(file_path) {
+        Ok(chain) => println!("chain loaded: {}", chain.is_valid()),// что тут делать?
+        Err(e) => println!("error: {}",e), 
+    }
 }
