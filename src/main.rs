@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -14,11 +14,13 @@ pub struct Block {
     pub data: String,
     pub previous_hash: String,
     pub hash: String,
+    pub nonce: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Blockchain {
     pub vec: Vec<Block>,
+    pub difficulty: u32,
 }
 
 impl Default for Blockchain {
@@ -29,31 +31,25 @@ impl Default for Blockchain {
 
 impl Blockchain {
     pub fn new() -> Self {
-        let data = "0".to_string();
         let timestamp = current_time();
-        let previous_hash = "0".to_string();
-        let result = format!("{}{}{}{}", 0, timestamp, data, previous_hash);
+        let difficulty = 2;
 
         Blockchain {
-            vec: vec![Block {
-                index: 0,
-                timestamp,
-                data,
-                previous_hash,
-                hash: hash(&result),
-            }],
+            difficulty,
+            vec: vec![Block::new(0, timestamp, "0".into(), "0".into(), difficulty)],
         }
     }
 
     pub fn add_block(&mut self, data: String) {
-        let last = match self.vec.last() {
+        let previous_hash = match self.vec.last() {
             Some(block) => block.hash.clone(),
             None => "0".to_string(),
         };
+        let timestamp = current_time();
         let index = self.vec.len() as u32;
 
-        let bl1: Block = Block::new(index, data, last);
-        self.vec.push(bl1);
+        let first_block: Block = Block::new(index, timestamp, data, previous_hash, self.difficulty);
+        self.vec.push(first_block);
     }
 
     pub fn is_valid(&self) -> bool {
@@ -62,14 +58,21 @@ impl Blockchain {
                 return false;
             }
             let right_hash = format!(
-                "{}{}{}{}",
+                "{}{}{}{}{}",
                 self.vec[j].index,
                 self.vec[j].timestamp,
                 self.vec[j].data,
-                self.vec[j].previous_hash
+                self.vec[j].previous_hash,
+                self.vec[j].nonce
             );
+            if !self.vec[j]
+                .hash
+                .starts_with(&"0".repeat(self.difficulty as usize))
+            {
+                return false;
+            }
 
-            if hash(&right_hash) != self.vec[j].hash {
+            if make_hash(&right_hash) != self.vec[j].hash {
                 return false;
             }
         }
@@ -78,16 +81,22 @@ impl Blockchain {
 }
 
 impl Block {
-    pub fn new(index: u32, data: String, previous_hash: String) -> Self {
-        let timestamp = current_time();
-        let result = format!("{}{}{}{}", index, timestamp, data, previous_hash);
+    pub fn new(
+        index: u32,
+        timestamp: u64,
+        data: String,
+        previous_hash: String,
+        difficulty: u32,
+    ) -> Self {
+        let (nonce, hash) = mine(difficulty as usize, index, timestamp, &data, &previous_hash);
 
         Block {
             index,
             timestamp,
             data,
+            hash,
             previous_hash,
-            hash: hash(&result),
+            nonce,
         }
     }
 }
@@ -101,7 +110,7 @@ fn current_time() -> u64 {
         .as_secs()
 }
 
-fn hash(input: &str) -> String {
+fn make_hash(input: &str) -> String {
     hex::encode(Sha256::digest(input.as_bytes()))
 }
 
@@ -180,9 +189,29 @@ async fn main() {
         let peer_addr = format!("127.0.0.1:{}", p_port);
         sync_with_peer(&peer_addr, chain.clone()).await;
     }
-    {
-        let lock = chain.lock().await;
-        println!("chain loaded: {:?} {} ", lock, lock.vec.len());
+
+    let difficulty = [1, 3, 4];
+    for &diff in &difficulty {
+        // 1. Фиксируем время ДО выполнения функции
+        let start = Instant::now();
+
+        let mut bc = Blockchain {
+            difficulty: diff,
+            vec: vec![],
+        };
+        bc.vec.push(Block::new(
+            0,
+            current_time(),
+            "genesis".into(),
+            "0".into(),
+            diff,
+        ));
+        bc.add_block("Hello blockchain".to_string());
+
+        // 3. Вычисляем прошедшее время
+        let elapsed = start.elapsed();
+
+        println!("Функция {} сгенерировала за {:?}", diff, elapsed);
     }
 
     tokio::signal::ctrl_c().await.unwrap();
@@ -199,4 +228,61 @@ async fn handle_client(
     socket.write_all(json_data.as_bytes()).await?;
 
     Ok(())
+}
+
+fn mine(
+    difficulty: usize,
+    index: u32,
+    timestamp: u64,
+    data: &str,
+    previous_hash: &str,
+) -> (u64, String) {
+    let base = format!("{}{}{}{}", index, timestamp, data, previous_hash);
+    let mut nonce: u64 = 0;
+
+    loop {
+        let data_to_hash = format!("{}{}", base, nonce);
+        let hash = make_hash(&data_to_hash);
+
+        if hash.starts_with(&"0".repeat(difficulty)) {
+            return (nonce, hash);
+        }
+        nonce += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn test_mining_hello_blockchain() {
+        let difficulty = [2, 3, 4, 5];
+        for &diff in &difficulty {
+            let prefix = "Hello blockchain";
+
+            // 1. Фиксируем время ДО выполнения функции
+            let start = Instant::now();
+
+            // Вызываем вашу готовую функцию
+            let (nonce, hash) = mine(diff, 0, current_time(), prefix, "0");
+
+            // 3. Вычисляем прошедшее время
+            let elapsed = start.elapsed();
+
+            println!("Функция сгенерировала {} за {:?}", nonce, elapsed);
+            println!("Подошедший nonce: {}", nonce);
+            println!("Полученный хеш: {}", hash);
+
+            let expected_prefix = "0".repeat(diff);
+            assert!(
+                hash.starts_with(&expected_prefix),
+                "Хеш должен начинаться с '{}' при сложности {}",
+                expected_prefix,
+                diff
+            );
+        }
+    }
 }
