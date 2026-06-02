@@ -53,6 +53,31 @@ impl Blockchain {
     }
 
     pub fn is_valid(&self) -> bool {
+        if self.vec.is_empty() {
+            return false;
+        }
+
+        let genesis = &self.vec[0];
+        if genesis.index != 0 || genesis.previous_hash != "0" {
+            return false;
+        }
+
+        let right_hash = format!(
+            "{}{}{}{}{}",
+            genesis.index, genesis.timestamp, genesis.data, genesis.previous_hash, genesis.nonce
+        );
+
+        if make_hash(&right_hash) != genesis.hash {
+            return false;
+        }
+
+        if !genesis
+            .hash
+            .starts_with(&"0".repeat(self.difficulty as usize))
+        {
+            return false;
+        }
+
         for j in 1..self.vec.len() {
             if self.vec[j].previous_hash != self.vec[j - 1].hash {
                 return false;
@@ -65,14 +90,15 @@ impl Blockchain {
                 self.vec[j].previous_hash,
                 self.vec[j].nonce
             );
+
+            if make_hash(&right_hash) != self.vec[j].hash {
+                return false;
+            }
+
             if !self.vec[j]
                 .hash
                 .starts_with(&"0".repeat(self.difficulty as usize))
             {
-                return false;
-            }
-
-            if make_hash(&right_hash) != self.vec[j].hash {
                 return false;
             }
         }
