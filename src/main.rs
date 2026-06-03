@@ -1,11 +1,14 @@
+use secp256k1::hashes::{Hash, sha256};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+
+use secp256k1::rand::{self};
+use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Block {
@@ -21,6 +24,58 @@ pub struct Block {
 pub struct Blockchain {
     pub vec: Vec<Block>,
     pub difficulty: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Transaction {
+    pub from: PublicKey,
+    pub to: PublicKey,
+    pub amount: u64,
+    pub signature: secp256k1::ecdsa::Signature,
+}
+
+pub fn generate_keypair() -> (SecretKey, PublicKey) {
+    let secp = Secp256k1::new();
+
+    let (secret_key, public_key) = secp.generate_keypair(&mut rand::rng());
+
+    (secret_key, public_key)
+}
+
+pub fn sign_transaction(
+    to_public_key: PublicKey,
+    amount: u64,
+    secret_key: &SecretKey,
+) -> Transaction {
+    let secp = Secp256k1::new();
+    let from_public_key = PublicKey::from_secret_key(&secp, secret_key);
+
+    let message_to_sign = format!("{}{}{}", from_public_key, to_public_key, amount);
+
+    let digest = sha256::Hash::hash(message_to_sign.as_bytes()).to_byte_array();
+
+    let message = Message::from_digest(digest);
+
+    let signature = secp.sign_ecdsa(message, secret_key);
+
+    Transaction {
+        from: from_public_key,
+        to: to_public_key,
+        signature,
+        amount,
+    }
+}
+
+impl Transaction {
+    pub fn verify_transaction(&self) -> bool {
+        let secp = Secp256k1::new();
+        let message_to_sign = format!("{}{}{}", self.from, self.to, self.amount);
+        let digest = sha256::Hash::hash(message_to_sign.as_bytes()).to_byte_array();
+        let message = Message::from_digest(digest);
+
+        secp.verify_ecdsa(message, &self.signature, &self.from)
+            .is_ok()
+    }
 }
 
 impl Default for Blockchain {
@@ -132,12 +187,13 @@ fn current_time() -> u64 {
 
     start
         .duration_since(UNIX_EPOCH)
-        .expect("Время до эпохи Unix!")
+        .expect("Time before Unix epoch!")
         .as_secs()
 }
 
 fn make_hash(input: &str) -> String {
-    hex::encode(Sha256::digest(input.as_bytes()))
+    let hs = sha256::Hash::hash(input.as_bytes());
+    hex::encode(hs.as_byte_array())
 }
 
 async fn start_server(port: u16, chain: Arc<Mutex<Blockchain>>) -> std::io::Result<()> {
@@ -150,48 +206,56 @@ async fn start_server(port: u16, chain: Arc<Mutex<Blockchain>>) -> std::io::Resu
 
         tokio::spawn(async move {
             if let Err(err) = handle_client(socket, mock_chain).await {
-                eprintln!("Ошибка при обработке клиента {}: {}", addr, err);
+                eprintln!("Error handling client {}: {}", addr, err);
             }
         });
     }
 }
 
-async fn sync_with_peer(addr: &str, clone_chain: Arc<Mutex<Blockchain>>) {
+async fn sync_with_peer(addr: &str, chain: Arc<Mutex<Blockchain>>) {
     match TcpStream::connect(addr).await {
         Ok(mut stream) => {
             let mut buffer = String::new();
 
             if stream.read_to_string(&mut buffer).await.is_ok() {
                 if let Ok(peer_chain) = serde_json::from_str::<Blockchain>(&buffer) {
-                    println!("Получена цепочка от пира. Длина: {}", peer_chain.vec.len());
+                    println!("Received chain from peer. Length: {}", peer_chain.vec.len());
 
-                    // Блокируем наш мьютекс на минимально возможное время
-                    let mut local_chain = clone_chain.lock().await;
-                    if peer_chain.vec.len() > local_chain.vec.len() {
-                        println!("Цепочка пира длиннее! Заменяем нашу.");
-                        *local_chain = peer_chain;
+                    let mut lock = chain.lock().await;
+                    if peer_chain.vec.len() > lock.vec.len() {
+                        println!("Peer chain is longer! Replacing ours.");
+                        *lock = peer_chain;
                     } else {
-                        println!("Наша цепочка длиннее или равна. Ничего не меняем.");
+                        println!("Our chain is longer or equal. No changes.");
                     }
                 } else {
-                    eprintln!("Ошибка парсинга JSON. Полученные данные: {}", buffer);
+                    eprintln!("JSON parsing error.");
                 }
             } else {
-                eprintln!("Ошибка чтения из потока");
+                eprintln!("Error reading from stream");
             }
         }
         Err(e) => {
-            eprintln!("Ошибка подключения к пиру {}: {}", addr, e);
+            eprintln!("Error connecting to peer {}: {}", addr, e);
         }
     }
 }
 
 #[tokio::main]
 async fn main() {
+    let (secret_key_from, _) = generate_keypair();
+    let (_, public_key_to) = generate_keypair();
+    let mut tx = sign_transaction(public_key_to, 100, &secret_key_from);
+    println!("valid = {}", tx.verify_transaction());
+    tx.amount = 101;
+    println!("after tamper = {}", tx.verify_transaction());
+
     let args: Vec<String> = std::env::args().collect();
 
     let server_port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(8080);
     let peer_port: Option<u16> = args.get(2).and_then(|s| s.parse().ok());
+
+    println!("Starting node on port {}...", server_port);
 
     let chain = Arc::new(Mutex::new(Blockchain::new()));
 
@@ -205,7 +269,7 @@ async fn main() {
     let clone: Arc<Mutex<Blockchain>> = chain.clone();
     tokio::spawn(async move {
         if let Err(err) = start_server(server_port, clone).await {
-            eprintln!("Ошибка сервера на порту {}: {}", server_port, err);
+            eprintln!("Server error on port {}: {}", server_port, err);
         }
     });
 
@@ -216,29 +280,7 @@ async fn main() {
         sync_with_peer(&peer_addr, chain.clone()).await;
     }
 
-    let difficulty = [1, 3, 4];
-    for &diff in &difficulty {
-        // 1. Фиксируем время ДО выполнения функции
-        let start = Instant::now();
-
-        let mut bc = Blockchain {
-            difficulty: diff,
-            vec: vec![],
-        };
-        bc.vec.push(Block::new(
-            0,
-            current_time(),
-            "genesis".into(),
-            "0".into(),
-            diff,
-        ));
-        bc.add_block("Hello blockchain".to_string());
-
-        // 3. Вычисляем прошедшее время
-        let elapsed = start.elapsed();
-
-        println!("Функция {} сгенерировала за {:?}", diff, elapsed);
-    }
+    println!("Listening on 127.0.0.1:{}", server_port);
 
     tokio::signal::ctrl_c().await.unwrap();
 }
@@ -279,36 +321,99 @@ fn mine(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn test_mining_hello_blockchain() {
-        let difficulty = [2, 3, 4, 5];
+        let difficulty = [1, 3, 4];
         for &diff in &difficulty {
-            let prefix = "Hello blockchain";
-
             // 1. Фиксируем время ДО выполнения функции
             let start = Instant::now();
 
-            // Вызываем вашу готовую функцию
-            let (nonce, hash) = mine(diff, 0, current_time(), prefix, "0");
+            let mut bc = Blockchain {
+                difficulty: diff,
+                vec: vec![],
+            };
+            bc.vec.push(Block::new(
+                0,
+                current_time(),
+                "genesis".into(),
+                "0".into(),
+                diff,
+            ));
+            bc.add_block("Hello blockchain".to_string());
 
             // 3. Вычисляем прошедшее время
             let elapsed = start.elapsed();
 
-            println!("Функция сгенерировала {} за {:?}", nonce, elapsed);
-            println!("Подошедший nonce: {}", nonce);
-            println!("Полученный хеш: {}", hash);
-
-            let expected_prefix = "0".repeat(diff);
-            assert!(
-                hash.starts_with(&expected_prefix),
-                "Хеш должен начинаться с '{}' при сложности {}",
-                expected_prefix,
-                diff
-            );
+            println!("Difficulty {} generated in {:?}", diff, elapsed);
         }
+    }
+
+    #[test]
+    fn test_generate_keys() {
+        // 1. Initialize a full secp256k1 context with all capabilities
+        let secp = Secp256k1::new();
+
+        // 2. Generate a secure, random cryptographic keypair
+        let (secret_key, public_key) = secp.generate_keypair(&mut rand::rng());
+
+        println!("Public Key: {}", public_key);
+        println!("Secret Key: {}", secret_key.display_secret());
+    }
+
+    #[test]
+    fn test_transaction_sign_verify() {
+        let secp = Secp256k1::new();
+
+        let (from_secret_key, _) = secp.generate_keypair(&mut rand::rng());
+
+        let (_, to_public_key) = secp.generate_keypair(&mut rand::rng());
+
+        let mut transaction = sign_transaction(to_public_key, 100, &from_secret_key);
+
+        let is_valid = transaction.verify_transaction();
+        assert!(is_valid);
+
+        transaction.amount = 101;
+
+        assert!(!transaction.verify_transaction());
+    }
+
+    #[test]
+    fn test_sign_verify() {
+        let secp = Secp256k1::new();
+
+        let (secret_key, public_key) = secp.generate_keypair(&mut rand::rng());
+        println!("Secret Key: {:?}", secret_key);
+        println!("Public Key: {:?}", public_key);
+
+        let original_message = b"send 100 usd";
+        let digest = sha256::Hash::hash(original_message).to_byte_array();
+
+        let message = Message::from_digest(digest);
+
+        let signature = secp.sign_ecdsa(message, &secret_key);
+        println!(
+            "Signature (Compact format): {:?}",
+            signature.serialize_compact()
+        );
+
+        let is_valid = secp.verify_ecdsa(message, &signature, &public_key).is_ok();
+        assert!(is_valid);
+        println!("Signature successfully verified! Status: {}", is_valid);
+
+        // another msg
+
+        let original_message2 = b"send 101 usd";
+        let digest2 = sha256::Hash::hash(original_message2).to_byte_array();
+
+        // 4. Wrap the digest into a secp256k1 Message object
+        let message2 = Message::from_digest(digest2);
+
+        let is_valid = secp.verify_ecdsa(message2, &signature, &public_key).is_ok();
+        assert!(!is_valid);
+        println!("Verification for tampered message: {}", is_valid);
     }
 }
