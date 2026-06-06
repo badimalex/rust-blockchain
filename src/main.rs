@@ -14,7 +14,7 @@ use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 pub struct Block {
     pub index: u32,
     pub timestamp: u64,
-    pub data: String,
+    pub transactions: Vec<Transaction>,
     pub previous_hash: String,
     pub hash: String,
     pub nonce: u64,
@@ -24,6 +24,7 @@ pub struct Block {
 pub struct Blockchain {
     pub vec: Vec<Block>,
     pub difficulty: u32,
+    pub mempool: Vec<Transaction>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -91,11 +92,22 @@ impl Blockchain {
 
         Blockchain {
             difficulty,
-            vec: vec![Block::new(0, timestamp, "0".into(), "0".into(), difficulty)],
+            vec: vec![Block::new(0, timestamp, vec![], "0".into(), difficulty)],
+            mempool: vec![],
         }
     }
 
-    pub fn add_block(&mut self, data: String) {
+    pub fn add_to_mempool(&mut self, tx: Transaction) -> bool {
+        if tx.verify_transaction() {
+            self.mempool.push(tx);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn add_block(&mut self) {
+        let transactions = std::mem::take(&mut self.mempool);
         let previous_hash = match self.vec.last() {
             Some(block) => block.hash.clone(),
             None => "0".to_string(),
@@ -103,7 +115,13 @@ impl Blockchain {
         let timestamp = current_time();
         let index = self.vec.len() as u32;
 
-        let first_block: Block = Block::new(index, timestamp, data, previous_hash, self.difficulty);
+        let first_block: Block = Block::new(
+            index,
+            timestamp,
+            transactions,
+            previous_hash,
+            self.difficulty,
+        );
         self.vec.push(first_block);
     }
 
@@ -117,9 +135,14 @@ impl Blockchain {
             return false;
         }
 
+        let transactions_str = serde_json::to_string(&genesis.transactions).unwrap();
         let right_hash = format!(
             "{}{}{}{}{}",
-            genesis.index, genesis.timestamp, genesis.data, genesis.previous_hash, genesis.nonce
+            genesis.index,
+            genesis.timestamp,
+            transactions_str,
+            genesis.previous_hash,
+            genesis.nonce
         );
 
         if make_hash(&right_hash) != genesis.hash {
@@ -137,11 +160,12 @@ impl Blockchain {
             if self.vec[j].previous_hash != self.vec[j - 1].hash {
                 return false;
             }
+            let transactions_str = serde_json::to_string(&self.vec[j].transactions).unwrap();
             let right_hash = format!(
                 "{}{}{}{}{}",
                 self.vec[j].index,
                 self.vec[j].timestamp,
-                self.vec[j].data,
+                transactions_str,
                 self.vec[j].previous_hash,
                 self.vec[j].nonce
             );
@@ -165,16 +189,22 @@ impl Block {
     pub fn new(
         index: u32,
         timestamp: u64,
-        data: String,
+        transactions: Vec<Transaction>,
         previous_hash: String,
         difficulty: u32,
     ) -> Self {
-        let (nonce, hash) = mine(difficulty as usize, index, timestamp, &data, &previous_hash);
+        let (nonce, hash) = mine(
+            difficulty as usize,
+            index,
+            timestamp,
+            &transactions,
+            &previous_hash,
+        );
 
         Block {
             index,
             timestamp,
-            data,
+            transactions,
             hash,
             previous_hash,
             nonce,
@@ -260,10 +290,16 @@ async fn main() {
     let chain = Arc::new(Mutex::new(Blockchain::new()));
 
     if server_port == 8080 {
+        let tx1 = sign_transaction(public_key_to, 101, &secret_key_from);
+        println!("valid = {}", tx1.verify_transaction());
+        let tx2 = sign_transaction(public_key_to, 102, &secret_key_from);
+        println!("valid = {}", tx2.verify_transaction());
+        let tx3 = sign_transaction(public_key_to, 103, &secret_key_from);
+        println!("valid = {}", tx3.verify_transaction());
         let mut lock = chain.lock().await;
-        lock.add_block(String::from("send 1 usd"));
-        lock.add_block(String::from("send 2 usd"));
-        lock.add_block(String::from("send 3 usd"));
+        lock.add_to_mempool(tx1);
+        lock.add_to_mempool(tx2);
+        lock.add_to_mempool(tx3);
     }
 
     let clone: Arc<Mutex<Blockchain>> = chain.clone();
@@ -302,10 +338,14 @@ fn mine(
     difficulty: usize,
     index: u32,
     timestamp: u64,
-    data: &str,
+    transactions: &[Transaction],
     previous_hash: &str,
 ) -> (u64, String) {
-    let base = format!("{}{}{}{}", index, timestamp, data, previous_hash);
+    let transactions_str = serde_json::to_string(transactions).unwrap();
+    let base = format!(
+        "{}{}{}{}",
+        index, timestamp, transactions_str, previous_hash
+    );
     let mut nonce: u64 = 0;
 
     loop {
@@ -334,15 +374,15 @@ mod tests {
             let mut bc = Blockchain {
                 difficulty: diff,
                 vec: vec![],
+                mempool: vec![],
             };
-            bc.vec.push(Block::new(
-                0,
-                current_time(),
-                "genesis".into(),
-                "0".into(),
-                diff,
-            ));
-            bc.add_block("Hello blockchain".to_string());
+            bc.vec
+                .push(Block::new(0, current_time(), vec![], "0".into(), diff));
+            let (secret_key_from, _) = generate_keypair();
+            let (_, public_key_to) = generate_keypair();
+            let tx = sign_transaction(public_key_to, 200, &secret_key_from);
+            println!("valid = {}", tx.verify_transaction());
+            bc.add_to_mempool(tx);
 
             // 3. Вычисляем прошедшее время
             let elapsed = start.elapsed();
@@ -415,5 +455,38 @@ mod tests {
         let is_valid = secp.verify_ecdsa(message2, &signature, &public_key).is_ok();
         assert!(!is_valid);
         println!("Verification for tampered message: {}", is_valid);
+    }
+
+    #[test]
+    fn test_add_to_mempool() {
+        let (secret_key_from, _) = generate_keypair();
+        let (_, public_key_to) = generate_keypair();
+
+        let tx1 = sign_transaction(public_key_to, 101, &secret_key_from);
+        println!("valid 1 = {}", tx1.verify_transaction());
+        let tx2 = sign_transaction(public_key_to, 102, &secret_key_from);
+        println!("valid 2 = {}", tx2.verify_transaction());
+        let mut tx3 = sign_transaction(public_key_to, 103, &secret_key_from);
+        tx3.amount = 999;
+        println!("valid 3 = {}", tx3.verify_transaction());
+
+        let diff = 4;
+
+        let mut bc = Blockchain {
+            difficulty: diff,
+            vec: vec![],
+            mempool: vec![],
+        };
+        bc.vec
+            .push(Block::new(0, current_time(), vec![], "0".into(), diff));
+
+        bc.add_to_mempool(tx1);
+        bc.add_to_mempool(tx2);
+        bc.add_to_mempool(tx3);
+
+        bc.add_block();
+        let last_block = bc.vec.last().unwrap();
+
+        assert_eq!(last_block.transactions.len(), 2);
     }
 }
