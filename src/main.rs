@@ -107,10 +107,7 @@ fn create_transaction_message(
     nonce: u64,
     data: &Vec<u8>,
 ) -> Result<Message, TransactionError> {
-
-
     let payload = TransactionPayload {
-
         from: from.to_string(),
 
         to: to.to_string(),
@@ -121,19 +118,13 @@ fn create_transaction_message(
 
         nonce,
 
-        instruction_data:data,
+        instruction_data: data,
     };
 
-
     let serialized =
-        serde_json::to_vec(&payload)
-            .map_err(|_| TransactionError::SerializationFailed)?;
+        bincode::serialize(&payload).map_err(|_| TransactionError::SerializationFailed)?;
 
-
-    let hash =
-        sha256::Hash::hash(&serialized)
-            .to_byte_array();
-
+    let hash = sha256::Hash::hash(&serialized).to_byte_array();
 
     Ok(Message::from_digest(hash))
 }
@@ -183,8 +174,8 @@ pub fn sign_transaction(
 impl Transaction {
     pub fn verify_transaction(&self) -> Result<(), TransactionError> {
         let secp = Secp256k1::new();
-       
-         let message = create_transaction_message(
+
+        let message = create_transaction_message(
             &self.from,
             &self.to,
             self.amount,
@@ -193,8 +184,8 @@ impl Transaction {
             &self.instruction_data,
         )?;
 
-       secp.verify_ecdsa(message, &self.signature, &self.from)
-        .map_err(|_| TransactionError::InvalidSignature)?;
+        secp.verify_ecdsa(message, &self.signature, &self.from)
+            .map_err(|_| TransactionError::InvalidSignature)?;
 
         Ok(())
     }
@@ -268,16 +259,15 @@ impl Blockchain {
         );
     }
 
-    pub fn add_to_mempool(&mut self, tx: Transaction) ->Result<(),MempoolError> {
-        tx.verify_transaction().map_err(|_|MempoolError::InvalidSignature)?;
+    pub fn add_to_mempool(&mut self, tx: Transaction) -> Result<(), MempoolError> {
+        tx.verify_transaction()
+            .map_err(|_| MempoolError::InvalidSignature)?;
 
         let expected_nonce = self.nonces.get(&tx.from).unwrap_or(&0)
             + self.mempool.iter().filter(|t| t.from == tx.from).count() as u64;
 
         if expected_nonce != tx.nonce {
-            return Err(
-                MempoolError::InvalidNonce
-            );
+            return Err(MempoolError::InvalidNonce);
         }
 
         let pending_balance: u64 = self
@@ -299,7 +289,7 @@ impl Blockchain {
             }
             None => {
                 println!("false: no account");
-                 Err(MempoolError::AccountNotFound)
+                Err(MempoolError::AccountNotFound)
             }
         }
     }
@@ -344,14 +334,15 @@ impl Blockchain {
             if let Ok(target_key) = PublicKey::from_slice(target_key_bytes) {
                 if let Some(acc) = self.accounts.get_mut(&target_key) {
                     if acc.owner == *program_id {
-
                         if target_key == *caller {
                             println!("✅ Owner check AND Signer check passed. Writing data...");
                             acc.data = text_bytes.to_vec();
                         } else {
-                            println!("🛡️ SECURITY ERROR 2: Caller does not own this data account! Access denied.");
+                            println!(
+                                "🛡️ SECURITY ERROR 2: Caller does not own this data account! Access denied."
+                            );
                         }
-                        
+
                         println!("Owner check passed. Writing data...");
                         // acc.data = text_bytes.to_vec();
                     } else {
@@ -465,16 +456,15 @@ impl Blockchain {
             return Ok(false);
         }
 
-        let transactions_str = serde_json::to_string(&genesis.transactions)?;
-        let coinbase_str = serde_json::to_string(&genesis.coinbase)?;
-        let base = format!(
-            "{}{}{}{}{}",
-            genesis.index, genesis.timestamp, genesis.previous_hash, transactions_str, coinbase_str,
-        );
-
-        let right_hash = format!("{}{}", base, genesis.nonce);
-
-        if make_hash(&right_hash) != genesis.hash {
+        if hash_block(
+            genesis.index,
+            genesis.timestamp,
+            &genesis.transactions,
+            &genesis.previous_hash,
+            &genesis.coinbase,
+            genesis.nonce,
+        ) != genesis.hash
+        {
             return Ok(false);
         }
 
@@ -496,19 +486,16 @@ impl Blockchain {
             if self.vec[j].previous_hash != self.vec[j - 1].hash {
                 return Ok(false);
             }
-            let transactions_str = serde_json::to_string(&self.vec[j].transactions)?;
-            let coinbase_str = serde_json::to_string(&self.vec[j].coinbase)?;
-            let base = format!(
-                "{}{}{}{}{}",
+
+            if hash_block(
                 self.vec[j].index,
                 self.vec[j].timestamp,
-                self.vec[j].previous_hash,
-                transactions_str,
-                coinbase_str,
-            );
-            let right_hash = format!("{}{}", base, self.vec[j].nonce);
-
-            if make_hash(&right_hash) != self.vec[j].hash {
+                &self.vec[j].transactions,
+                &self.vec[j].previous_hash,
+                &self.vec[j].coinbase,
+                self.vec[j].nonce,
+            ) != self.vec[j].hash
+            {
                 return Ok(false);
             }
 
@@ -569,9 +556,28 @@ fn current_time() -> u64 {
         .as_secs()
 }
 
-fn make_hash(input: &str) -> String {
-    let hs = sha256::Hash::hash(input.as_bytes());
-    hex::encode(hs.as_byte_array())
+fn hash_block(
+    index: u32,
+    timestamp: u64,
+    transactions: &[Transaction],
+    previous_hash: &str,
+    coinbase: &CoinbaseTransaction,
+
+    nonce: u64,
+) -> String {
+    let bytes = bincode::serialize(&(
+        index,
+        timestamp,
+        transactions,
+        previous_hash,
+        coinbase,
+        nonce,
+    ))
+    .unwrap();
+
+    let hash = sha256::Hash::hash(&bytes);
+
+    hex::encode(hash.as_byte_array())
 }
 
 async fn start_server(port: u16, chain: Arc<Mutex<Blockchain>>) -> std::io::Result<()> {
@@ -627,8 +633,8 @@ async fn sync_with_peer(addr: &str, chain: Arc<Mutex<Blockchain>>) {
     }
 }
 
-  #[tokio::main]
-  async fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (_, faucet_program_id) = generate_keypair();
     let (_, notebook_program_id) = generate_keypair();
     let (secret_key_from, public_key_from) = generate_keypair();
@@ -707,18 +713,17 @@ fn mine(
     previous_hash: &str,
     coinbase: &CoinbaseTransaction,
 ) -> (u64, String) {
-    let transactions_str =
-        serde_json::to_string(transactions).expect("serialization should not fail");
-    let coinbase_str = serde_json::to_string(coinbase).expect("serialization should not fail");
-    let base = format!(
-        "{}{}{}{}{}",
-        index, timestamp, previous_hash, transactions_str, coinbase_str
-    );
     let mut nonce: u64 = 0;
 
     loop {
-        let data_to_hash = format!("{}{}", base, nonce);
-        let hash = make_hash(&data_to_hash);
+        let hash = hash_block(
+            index,
+            timestamp,
+            transactions,
+            previous_hash,
+            coinbase,
+            nonce,
+        );
 
         if hash.starts_with(&"0".repeat(difficulty)) {
             return (nonce, hash);
@@ -798,7 +803,8 @@ mod tests {
 
         let (_, to_public_key) = secp.generate_keypair(&mut rand::rng());
 
-        let mut transaction = sign_transaction(to_public_key, 100, vec![], &from_secret_key, 0, 0).unwrap();
+        let mut transaction =
+            sign_transaction(to_public_key, 100, vec![], &from_secret_key, 0, 0).unwrap();
 
         let is_valid = transaction.verify_transaction().is_ok();
         assert!(is_valid);
@@ -1045,7 +1051,7 @@ mod tests {
         let (_, notebook_program_id) = generate_keypair();
         let (_, faucet_program_id) = generate_keypair();
         let (secret_key_from, public_key_from) = generate_keypair();
-   
+
         let (_, miner_pubkey) = generate_keypair();
         let diff = 4;
 
