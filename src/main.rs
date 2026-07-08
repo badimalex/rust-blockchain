@@ -55,6 +55,17 @@ pub struct Block {
     pub nonce: u64,
 }
 
+#[derive(Debug)]
+pub enum BlockError {
+    Transaction(TransferError),
+}
+
+impl From<TransferError> for BlockError {
+    fn from(err: TransferError) -> Self {
+        BlockError::Transaction(err)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Account {
     pub coins: u64,
@@ -109,15 +120,10 @@ fn create_transaction_message(
 ) -> Result<Message, TransactionError> {
     let payload = TransactionPayload {
         from: from.to_string(),
-
         to: to.to_string(),
-
         amount,
-
         fee,
-
         nonce,
-
         instruction_data: data,
     };
 
@@ -309,7 +315,6 @@ impl Blockchain {
         _amount: u64,
     ) {
         if program_id == &self.faucet_program_id {
-            // Команда "1" означает "Начислить 100 монет"
             if instruction_data == [1] {
                 if let Some(user) = self.accounts.get_mut(caller) {
                     user.coins += 100;
@@ -335,11 +340,11 @@ impl Blockchain {
                 if let Some(acc) = self.accounts.get_mut(&target_key) {
                     if acc.owner == *program_id {
                         if target_key == *caller {
-                            println!("✅ Owner check AND Signer check passed. Writing data...");
+                            println!("Owner check AND Signer check passed. Writing data...");
                             acc.data = text_bytes.to_vec();
                         } else {
                             println!(
-                                "🛡️ SECURITY ERROR 2: Caller does not own this data account! Access denied."
+                                "SECURITY ERROR 2: Caller does not own this data account! Access denied."
                             );
                         }
 
@@ -393,7 +398,7 @@ impl Blockchain {
         Ok(())
     }
 
-    pub fn add_block(&mut self, miner: PublicKey) -> bool {
+    pub fn add_block(&mut self, miner: PublicKey) -> Result<(), BlockError> {
         let mut transactions = std::mem::take(&mut self.mempool);
         transactions.sort_by(|tx1, tx2| tx2.fee.cmp(&tx1.fee));
 
@@ -412,8 +417,8 @@ impl Blockchain {
                     println!("transaction successfully added")
                 }
                 Err(err) => {
-                    eprintln!("Error handling transaction {}: {:?}", tx.from, err);
-                    return false;
+                    self.mempool = transactions;
+                    return Err(BlockError::Transaction(err));
                 }
             }
         }
@@ -443,7 +448,7 @@ impl Blockchain {
 
         self.vec.push(first_block);
 
-        true
+        Ok(())
     }
 
     pub fn is_valid(&self) -> Result<bool, serde_json::Error> {
@@ -744,7 +749,6 @@ mod tests {
         let (_, miner_pubkey) = generate_keypair();
         let difficulty = [1, 3, 4];
         for &diff in &difficulty {
-            // 1. Фиксируем время ДО выполнения функции
             let start = Instant::now();
 
             let mut bc = Blockchain {
@@ -776,7 +780,6 @@ mod tests {
             println!("valid = {:?}", tx.verify_transaction());
             let _ = bc.add_to_mempool(tx);
 
-            // 3. Вычисляем прошедшее время
             let elapsed = start.elapsed();
 
             println!("Difficulty {} generated in {:?}", diff, elapsed);
@@ -916,7 +919,7 @@ mod tests {
         let _ = bc.add_to_mempool(tx2);
         let _ = bc.add_to_mempool(tx3);
 
-        bc.add_block(miner_pubkey);
+        let _ = bc.add_block(miner_pubkey);
         let last_block = bc.vec.last().unwrap();
 
         assert_eq!(last_block.transactions.len(), 2);
@@ -987,14 +990,13 @@ mod tests {
 
         assert_eq!(bc.mempool.len(), 1);
 
-        assert!(bc.add_block(miner_pubkey));
+        assert!(bc.add_block(miner_pubkey).is_ok());
         let last_block = bc.vec.last().unwrap();
 
         assert_eq!(last_block.transactions.len(), 1);
 
         println!("{:?}", bc.accounts);
 
-        // Баланс отправителя уменьшился на 50
         assert_eq!(bc.accounts.get(&public_key_from).unwrap().coins, 50);
 
         assert_eq!(bc.accounts.get(&public_key_to).unwrap().coins, 50);
@@ -1005,7 +1007,7 @@ mod tests {
         let (_, notebook_program_id) = generate_keypair();
         let (_, faucet_program_id) = generate_keypair();
         let (secret_key_from, public_key_from) = generate_keypair();
-        let (_, miner_pubkey) = generate_keypair(); // ← ДОБАВЬ МАЙНЕРА
+        let (_, miner_pubkey) = generate_keypair(); 
 
         let diff = 4;
 
@@ -1035,7 +1037,7 @@ mod tests {
         let tx1 = sign_transaction(faucet_program_id, 0, vec![1], &secret_key_from, 0, 0).unwrap();
         println!("valid 1 = {:?}", tx1.verify_transaction());
         assert!(bc.add_to_mempool(tx1).is_ok());
-        assert!(bc.add_block(miner_pubkey));
+        assert!(bc.add_block(miner_pubkey).is_ok());
         let last_block = bc.vec.last().unwrap();
 
         assert_eq!(last_block.transactions.len(), 1);
@@ -1087,7 +1089,7 @@ mod tests {
         let tx1 = sign_transaction(notebook_program_id, 0, data, &secret_key_from, 0, 0).unwrap();
         println!("valid 1 = {:?}", tx1.verify_transaction());
         assert!(bc.add_to_mempool(tx1).is_ok());
-        assert!(bc.add_block(miner_pubkey));
+        assert!(bc.add_block(miner_pubkey).is_ok());
         let last_block = bc.vec.last().unwrap();
 
         assert_eq!(last_block.transactions.len(), 1);
@@ -1150,7 +1152,7 @@ mod tests {
         let tx1 = sign_transaction(notebook_program_id, 0, data, &secret_key_from, 0, 0).unwrap();
         println!("valid 1 = {:?}", tx1.verify_transaction());
         assert!(bc.add_to_mempool(tx1).is_ok());
-        assert!(bc.add_block(miner_pubkey));
+        assert!(bc.add_block(miner_pubkey).is_ok());
         let last_block = bc.vec.last().unwrap();
 
         assert_eq!(last_block.transactions.len(), 1);
@@ -1251,7 +1253,7 @@ mod tests {
         let _ = bc.add_to_mempool(tx2);
         let _ = bc.add_to_mempool(tx3);
 
-        bc.add_block(miner_pubkey);
+        let _ = bc.add_block(miner_pubkey);
         let last_block = bc.vec.last().unwrap();
         println!("{:?}", last_block.transactions);
         assert_eq!(last_block.transactions[0].fee, 50);
@@ -1328,7 +1330,7 @@ mod tests {
         let _ = bc.add_to_mempool(tx1);
         let _ = bc.add_to_mempool(tx2);
 
-        bc.add_block(miner_pubkey);
+        let _ = bc.add_block(miner_pubkey);
 
         let last_block = bc.vec.last().unwrap();
 
