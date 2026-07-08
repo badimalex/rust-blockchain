@@ -13,10 +13,34 @@ use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 
 const BLOCK_REWARD: u64 = 50;
 
+#[derive(Serialize, Deserialize, Debug)]
+pub enum TransactionError {
+    SerializationFailed,
+    InvalidSignature,
+}
+
+#[derive(Serialize)]
+struct TransactionPayload<'a> {
+    from: String,
+    to: String,
+    amount: u64,
+    fee: u64,
+    nonce: u64,
+    instruction_data: &'a Vec<u8>,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum TransferError {
     SenderNotFound,
     ReceiverNotFound,
+    InsufficientFunds,
+}
+
+#[derive(Debug)]
+pub enum MempoolError {
+    InvalidSignature,
+    AccountNotFound,
+    InvalidNonce,
     InsufficientFunds,
 }
 
@@ -75,6 +99,45 @@ pub fn generate_keypair() -> (SecretKey, PublicKey) {
     (secret_key, public_key)
 }
 
+fn create_transaction_message(
+    from: &PublicKey,
+    to: &PublicKey,
+    amount: u64,
+    fee: u64,
+    nonce: u64,
+    data: &Vec<u8>,
+) -> Result<Message, TransactionError> {
+
+
+    let payload = TransactionPayload {
+
+        from: from.to_string(),
+
+        to: to.to_string(),
+
+        amount,
+
+        fee,
+
+        nonce,
+
+        instruction_data:data,
+    };
+
+
+    let serialized =
+        serde_json::to_vec(&payload)
+            .map_err(|_| TransactionError::SerializationFailed)?;
+
+
+    let hash =
+        sha256::Hash::hash(&serialized)
+            .to_byte_array();
+
+
+    Ok(Message::from_digest(hash))
+}
+
 pub fn sign_transaction(
     to_public_key: PublicKey,
     amount: u64,
@@ -82,23 +145,31 @@ pub fn sign_transaction(
     secret_key: &SecretKey,
     fee: u64,
     nonce: u64,
-) -> Transaction {
+) -> Result<Transaction, TransactionError> {
     let secp = Secp256k1::new();
     let from_public_key = PublicKey::from_secret_key(&secp, secret_key);
 
-    let instruction_hex = hex::encode(&instruction_data);
-    let message_to_sign = format!(
-        "{}{}{}{}{}{}",
-        from_public_key, to_public_key, amount, fee, nonce, instruction_hex
-    );
+    // let instruction_hex = hex::encode(&instruction_data);
+    // let message_to_sign = format!(
+    //     "{}{}{}{}{}{}",
+    //     from_public_key, to_public_key, amount, fee, nonce, instruction_hex
+    // );
+    let message = create_transaction_message(
+        &from_public_key,
+        &to_public_key,
+        amount,
+        fee,
+        nonce,
+        &instruction_data,
+    )?;
 
-    let digest = sha256::Hash::hash(message_to_sign.as_bytes()).to_byte_array();
+    // let digest = sha256::Hash::hash(message.as_bytes()).to_byte_array();
 
-    let message = Message::from_digest(digest);
+    // let message = Message::from_digest(digest);
 
     let signature = secp.sign_ecdsa(message, secret_key);
 
-    Transaction {
+    Ok(Transaction {
         from: from_public_key,
         to: to_public_key,
         signature,
@@ -106,23 +177,26 @@ pub fn sign_transaction(
         amount,
         fee,
         nonce,
-    }
+    })
 }
 
 impl Transaction {
-    pub fn verify_transaction(&self) -> bool {
+    pub fn verify_transaction(&self) -> Result<(), TransactionError> {
         let secp = Secp256k1::new();
-        let instruction_hex = hex::encode(&self.instruction_data);
+       
+         let message = create_transaction_message(
+            &self.from,
+            &self.to,
+            self.amount,
+            self.fee,
+            self.nonce,
+            &self.instruction_data,
+        )?;
 
-        let message_to_sign = format!(
-            "{}{}{}{}{}{}",
-            self.from, self.to, self.amount, self.fee, self.nonce, instruction_hex
-        );
-        let digest = sha256::Hash::hash(message_to_sign.as_bytes()).to_byte_array();
-        let message = Message::from_digest(digest);
+       secp.verify_ecdsa(message, &self.signature, &self.from)
+        .map_err(|_| TransactionError::InvalidSignature)?;
 
-        secp.verify_ecdsa(message, &self.signature, &self.from)
-            .is_ok()
+        Ok(())
     }
 }
 
@@ -194,16 +268,16 @@ impl Blockchain {
         );
     }
 
-    pub fn add_to_mempool(&mut self, tx: Transaction) -> bool {
-        if !tx.verify_transaction() {
-            println!("false: bad signature");
-            return false;
-        }
+    pub fn add_to_mempool(&mut self, tx: Transaction) ->Result<(),MempoolError> {
+        tx.verify_transaction().map_err(|_|MempoolError::InvalidSignature)?;
+
         let expected_nonce = self.nonces.get(&tx.from).unwrap_or(&0)
             + self.mempool.iter().filter(|t| t.from == tx.from).count() as u64;
 
         if expected_nonce != tx.nonce {
-            return false;
+            return Err(
+                MempoolError::InvalidNonce
+            );
         }
 
         let pending_balance: u64 = self
@@ -217,15 +291,15 @@ impl Blockchain {
             Some(balance) => {
                 if balance.coins >= tx.amount + tx.fee + pending_balance {
                     self.mempool.push(tx);
-                    true
+                    Ok(())
                 } else {
                     println!("false: not enough money");
-                    false
+                    Err(MempoolError::InsufficientFunds)
                 }
             }
             None => {
                 println!("false: no account");
-                false
+                 Err(MempoolError::AccountNotFound)
             }
         }
     }
@@ -270,11 +344,19 @@ impl Blockchain {
             if let Ok(target_key) = PublicKey::from_slice(target_key_bytes) {
                 if let Some(acc) = self.accounts.get_mut(&target_key) {
                     if acc.owner == *program_id {
+
+                        if target_key == *caller {
+                            println!("✅ Owner check AND Signer check passed. Writing data...");
+                            acc.data = text_bytes.to_vec();
+                        } else {
+                            println!("🛡️ SECURITY ERROR 2: Caller does not own this data account! Access denied.");
+                        }
+                        
                         println!("Owner check passed. Writing data...");
-                        acc.data = text_bytes.to_vec();
+                        // acc.data = text_bytes.to_vec();
                     } else {
                         println!(
-                            "🛡️ SECURITY ERROR: Program does not own this account! Access denied."
+                            "SECURITY ERROR: Program does not own this account! Access denied."
                         );
                     }
                 } else {
@@ -545,16 +627,17 @@ async fn sync_with_peer(addr: &str, chain: Arc<Mutex<Blockchain>>) {
     }
 }
 
-#[tokio::main]
-async fn main() {
+  #[tokio::main]
+  async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (_, faucet_program_id) = generate_keypair();
     let (_, notebook_program_id) = generate_keypair();
     let (secret_key_from, public_key_from) = generate_keypair();
     let (_, public_key_to) = generate_keypair();
-    let mut tx = sign_transaction(public_key_to, 100, vec![], &secret_key_from, 0, 0);
-    println!("valid = {}", tx.verify_transaction());
+    let mut tx = sign_transaction(public_key_to, 100, vec![], &secret_key_from, 0, 0).unwrap();
+
+    println!("valid = {:?}", tx.verify_transaction());
     tx.amount = 101;
-    println!("after tamper = {}", tx.verify_transaction());
+    println!("after tamper = {:?}", tx.verify_transaction());
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -570,16 +653,16 @@ async fn main() {
     )));
 
     if server_port == 8080 {
-        let tx1 = sign_transaction(public_key_to, 101, vec![], &secret_key_from, 0, 0);
-        println!("valid = {}", tx1.verify_transaction());
-        let tx2 = sign_transaction(public_key_to, 102, vec![], &secret_key_from, 0, 1);
-        println!("valid = {}", tx2.verify_transaction());
-        let tx3 = sign_transaction(public_key_to, 103, vec![], &secret_key_from, 0, 2);
-        println!("valid = {}", tx3.verify_transaction());
+        let tx1 = sign_transaction(public_key_to, 101, vec![], &secret_key_from, 0, 0).unwrap();
+        println!("valid = {:?}", tx1.verify_transaction());
+        let tx2 = sign_transaction(public_key_to, 102, vec![], &secret_key_from, 0, 1).unwrap();
+        println!("valid = {:?}", tx2.verify_transaction());
+        let tx3 = sign_transaction(public_key_to, 103, vec![], &secret_key_from, 0, 2).unwrap();
+        println!("valid = {:?}", tx3.verify_transaction());
         let mut lock = chain.lock().await;
-        lock.add_to_mempool(tx1);
-        lock.add_to_mempool(tx2);
-        lock.add_to_mempool(tx3);
+        let _ = lock.add_to_mempool(tx1);
+        let _ = lock.add_to_mempool(tx2);
+        let _ = lock.add_to_mempool(tx3);
     }
 
     let clone: Arc<Mutex<Blockchain>> = chain.clone();
@@ -598,7 +681,9 @@ async fn main() {
 
     println!("Listening on 127.0.0.1:{}", server_port);
 
-    tokio::signal::ctrl_c().await.unwrap();
+    tokio::signal::ctrl_c().await?;
+
+    Ok(())
 }
 
 async fn handle_client(
@@ -682,9 +767,9 @@ mod tests {
             ));
             let (secret_key_from, _) = generate_keypair();
             let (_, public_key_to) = generate_keypair();
-            let tx = sign_transaction(public_key_to, 200, vec![], &secret_key_from, 0, 0);
-            println!("valid = {}", tx.verify_transaction());
-            bc.add_to_mempool(tx);
+            let tx = sign_transaction(public_key_to, 200, vec![], &secret_key_from, 0, 0).unwrap();
+            println!("valid = {:?}", tx.verify_transaction());
+            let _ = bc.add_to_mempool(tx);
 
             // 3. Вычисляем прошедшее время
             let elapsed = start.elapsed();
@@ -713,14 +798,14 @@ mod tests {
 
         let (_, to_public_key) = secp.generate_keypair(&mut rand::rng());
 
-        let mut transaction = sign_transaction(to_public_key, 100, vec![], &from_secret_key, 0, 0);
+        let mut transaction = sign_transaction(to_public_key, 100, vec![], &from_secret_key, 0, 0).unwrap();
 
-        let is_valid = transaction.verify_transaction();
+        let is_valid = transaction.verify_transaction().is_ok();
         assert!(is_valid);
 
         transaction.amount = 101;
 
-        assert!(!transaction.verify_transaction());
+        assert!(transaction.verify_transaction().is_err());
     }
 
     #[test]
@@ -767,13 +852,13 @@ mod tests {
         let (_, public_key_to) = generate_keypair();
         let (_, miner_pubkey) = generate_keypair();
 
-        let tx1 = sign_transaction(public_key_to, 101, vec![], &secret_key_from, 0, 0);
-        println!("valid 1 = {}", tx1.verify_transaction());
-        let tx2 = sign_transaction(public_key_to, 102, vec![], &secret_key_from, 0, 1);
-        println!("valid 2 = {}", tx2.verify_transaction());
-        let mut tx3 = sign_transaction(public_key_to, 103, vec![], &secret_key_from, 0, 2);
+        let tx1 = sign_transaction(public_key_to, 101, vec![], &secret_key_from, 0, 0).unwrap();
+        println!("valid 1 = {:?}", tx1.verify_transaction());
+        let tx2 = sign_transaction(public_key_to, 102, vec![], &secret_key_from, 0, 1).unwrap();
+        println!("valid 2 = {:?}", tx2.verify_transaction());
+        let mut tx3 = sign_transaction(public_key_to, 103, vec![], &secret_key_from, 0, 2).unwrap();
         tx3.amount = 999;
-        println!("valid 3 = {}", tx3.verify_transaction());
+        println!("valid 3 = {:?}", tx3.verify_transaction());
 
         let diff = 4;
 
@@ -821,9 +906,9 @@ mod tests {
             genesis_coinbase,
         ));
 
-        bc.add_to_mempool(tx1);
-        bc.add_to_mempool(tx2);
-        bc.add_to_mempool(tx3);
+        let _ = bc.add_to_mempool(tx1);
+        let _ = bc.add_to_mempool(tx2);
+        let _ = bc.add_to_mempool(tx3);
 
         bc.add_block(miner_pubkey);
         let last_block = bc.vec.last().unwrap();
@@ -839,10 +924,10 @@ mod tests {
         let (_, public_key_to) = generate_keypair();
         let (_, miner_pubkey) = generate_keypair();
 
-        let tx1 = sign_transaction(public_key_to, 50, vec![], &secret_key_from, 0, 0);
-        println!("valid 1 = {}", tx1.verify_transaction());
-        let tx2 = sign_transaction(public_key_to, 200, vec![], &secret_key_from, 0, 1);
-        println!("valid 2 = {}", tx2.verify_transaction());
+        let tx1 = sign_transaction(public_key_to, 50, vec![], &secret_key_from, 0, 0).unwrap();
+        println!("valid 1 = {:?}", tx1.verify_transaction());
+        let tx2 = sign_transaction(public_key_to, 200, vec![], &secret_key_from, 0, 1).unwrap();
+        println!("valid 2 = {:?}", tx2.verify_transaction());
 
         let diff = 4;
 
@@ -890,9 +975,9 @@ mod tests {
             genesis_coinbase,
         ));
 
-        assert!(bc.add_to_mempool(tx1));
+        assert!(bc.add_to_mempool(tx1).is_ok());
 
-        assert!(!bc.add_to_mempool(tx2));
+        assert!(bc.add_to_mempool(tx2).is_err());
 
         assert_eq!(bc.mempool.len(), 1);
 
@@ -941,9 +1026,9 @@ mod tests {
 
         bc.deploy_program(faucet_program_id, vec![]);
 
-        let tx1 = sign_transaction(faucet_program_id, 0, vec![1], &secret_key_from, 0, 0);
-        println!("valid 1 = {}", tx1.verify_transaction());
-        assert!(bc.add_to_mempool(tx1));
+        let tx1 = sign_transaction(faucet_program_id, 0, vec![1], &secret_key_from, 0, 0).unwrap();
+        println!("valid 1 = {:?}", tx1.verify_transaction());
+        assert!(bc.add_to_mempool(tx1).is_ok());
         assert!(bc.add_block(miner_pubkey));
         let last_block = bc.vec.last().unwrap();
 
@@ -960,7 +1045,7 @@ mod tests {
         let (_, notebook_program_id) = generate_keypair();
         let (_, faucet_program_id) = generate_keypair();
         let (secret_key_from, public_key_from) = generate_keypair();
-        let (_, data_account_key) = generate_keypair();
+   
         let (_, miner_pubkey) = generate_keypair();
         let diff = 4;
 
@@ -986,15 +1071,16 @@ mod tests {
         };
 
         bc.deploy_program(notebook_program_id, vec![]);
-        bc.create_data_account(data_account_key, notebook_program_id);
-
+        // bc.create_data_account(data_account_key, notebook_program_id);
+        bc.create_data_account(public_key_from, notebook_program_id);
         let mut data = vec![2]; // Команда 2
-        data.extend_from_slice(&data_account_key.serialize()); // 33 байта адреса
+        // data.extend_from_slice(&data_account_key.serialize()); // 33 байта адреса
+        data.extend_from_slice(&public_key_from.serialize());
         data.extend_from_slice(b"Hello Solana!"); // Текст
 
-        let tx1 = sign_transaction(notebook_program_id, 0, data, &secret_key_from, 0, 0);
-        println!("valid 1 = {}", tx1.verify_transaction());
-        assert!(bc.add_to_mempool(tx1));
+        let tx1 = sign_transaction(notebook_program_id, 0, data, &secret_key_from, 0, 0).unwrap();
+        println!("valid 1 = {:?}", tx1.verify_transaction());
+        assert!(bc.add_to_mempool(tx1).is_ok());
         assert!(bc.add_block(miner_pubkey));
         let last_block = bc.vec.last().unwrap();
 
@@ -1003,7 +1089,7 @@ mod tests {
         println!("{:?}", bc.accounts);
 
         assert_eq!(
-            bc.accounts.get(&data_account_key).unwrap().data,
+            bc.accounts.get(&public_key_from).unwrap().data,
             b"Hello Solana!"
         );
     }
@@ -1055,9 +1141,9 @@ mod tests {
         data.extend_from_slice(&victim_key.serialize()); // 33 байта адреса
         data.extend_from_slice(b"Hello Solana!"); // Текст
 
-        let tx1 = sign_transaction(notebook_program_id, 0, data, &secret_key_from, 0, 0);
-        println!("valid 1 = {}", tx1.verify_transaction());
-        assert!(bc.add_to_mempool(tx1));
+        let tx1 = sign_transaction(notebook_program_id, 0, data, &secret_key_from, 0, 0).unwrap();
+        println!("valid 1 = {:?}", tx1.verify_transaction());
+        assert!(bc.add_to_mempool(tx1).is_ok());
         assert!(bc.add_block(miner_pubkey));
         let last_block = bc.vec.last().unwrap();
 
@@ -1102,12 +1188,12 @@ mod tests {
         let (_, public_key_to) = generate_keypair();
         let (_, miner_pubkey) = generate_keypair();
 
-        let tx1 = sign_transaction(public_key_to, 25, vec![], &secret_key_from, 30, 0);
-        println!("valid 1 = {}", tx1.verify_transaction());
-        let tx2 = sign_transaction(public_key_to, 20, vec![], &secret_key_from, 10, 1);
-        println!("valid 2 = {}", tx2.verify_transaction());
-        let tx3 = sign_transaction(public_key_to, 15, vec![], &secret_key_from, 50, 2);
-        println!("valid 3 = {}", tx3.verify_transaction());
+        let tx1 = sign_transaction(public_key_to, 25, vec![], &secret_key_from, 30, 0).unwrap();
+        println!("valid 1 = {:?}", tx1.verify_transaction());
+        let tx2 = sign_transaction(public_key_to, 20, vec![], &secret_key_from, 10, 1).unwrap();
+        println!("valid 2 = {:?}", tx2.verify_transaction());
+        let tx3 = sign_transaction(public_key_to, 15, vec![], &secret_key_from, 50, 2).unwrap();
+        println!("valid 3 = {:?}", tx3.verify_transaction());
 
         let diff = 4;
 
@@ -1155,9 +1241,9 @@ mod tests {
             genesis_coinbase,
         ));
 
-        bc.add_to_mempool(tx1);
-        bc.add_to_mempool(tx2);
-        bc.add_to_mempool(tx3);
+        let _ = bc.add_to_mempool(tx1);
+        let _ = bc.add_to_mempool(tx2);
+        let _ = bc.add_to_mempool(tx3);
 
         bc.add_block(miner_pubkey);
         let last_block = bc.vec.last().unwrap();
@@ -1180,10 +1266,10 @@ mod tests {
         let (_, public_key_to) = generate_keypair();
         let (_, miner_pubkey) = generate_keypair();
 
-        let tx1 = sign_transaction(public_key_to, 25, vec![], &secret_key_from, 20, 0);
-        println!("valid 1 = {}", tx1.verify_transaction());
-        let tx2 = sign_transaction(public_key_to, 20, vec![], &secret_key_from, 10, 1);
-        println!("valid 2 = {}", tx2.verify_transaction());
+        let tx1 = sign_transaction(public_key_to, 25, vec![], &secret_key_from, 20, 0).unwrap();
+        println!("valid 1 = {:?}", tx1.verify_transaction());
+        let tx2 = sign_transaction(public_key_to, 20, vec![], &secret_key_from, 10, 1).unwrap();
+        println!("valid 2 = {:?}", tx2.verify_transaction());
 
         let diff = 4;
 
@@ -1233,8 +1319,8 @@ mod tests {
             genesis_coinbase,
         ));
 
-        bc.add_to_mempool(tx1);
-        bc.add_to_mempool(tx2);
+        let _ = bc.add_to_mempool(tx1);
+        let _ = bc.add_to_mempool(tx2);
 
         bc.add_block(miner_pubkey);
 
