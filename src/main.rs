@@ -19,14 +19,23 @@ pub enum TransactionError {
     InvalidSignature,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct AccountMeta {
+    pub pubkey: PublicKey,
+    pub is_signer: bool, // Подписал ли владелец этого аккаунта транзакцию своим приватным ключом?
+    pub is_writable: bool, // Разрешено ли программе изменять этот аккаунт (менять coins или data)?
+}
+
 #[derive(Serialize)]
 struct TransactionPayload<'a> {
+    program_id: String,
     from: String,
     to: String,
     amount: u64,
     fee: u64,
     nonce: u64,
     instruction_data: &'a Vec<u8>,
+    accounts: &'a [AccountMeta],
 }
 
 #[derive(Debug, PartialEq)]
@@ -34,6 +43,9 @@ pub enum TransferError {
     SenderNotFound,
     ReceiverNotFound,
     InsufficientFunds,
+    UnauthorizedSigner,
+    ReceiverNotWritable,
+    SenderNotWritable,
 }
 
 #[derive(Debug)]
@@ -82,6 +94,7 @@ pub struct Blockchain {
     pub accounts: HashMap<PublicKey, Account>,
     pub faucet_program_id: PublicKey,
     pub notebook_program_id: PublicKey,
+    pub distributor_program_id: PublicKey,
     pub nonces: HashMap<PublicKey, u64>,
 }
 
@@ -100,6 +113,8 @@ pub struct Transaction {
     pub instruction_data: Vec<u8>,
     pub fee: u64,
     pub nonce: u64,
+    pub accounts: Vec<AccountMeta>,
+    pub program_id: PublicKey,
 }
 
 pub fn generate_keypair() -> (SecretKey, PublicKey) {
@@ -111,20 +126,24 @@ pub fn generate_keypair() -> (SecretKey, PublicKey) {
 }
 
 fn create_transaction_message(
+    program_id: &PublicKey,
     from: &PublicKey,
     to: &PublicKey,
     amount: u64,
     fee: u64,
     nonce: u64,
     data: &Vec<u8>,
+    accounts: &[AccountMeta],
 ) -> Result<Message, TransactionError> {
     let payload = TransactionPayload {
+        program_id: program_id.to_string(),
         from: from.to_string(),
         to: to.to_string(),
         amount,
         fee,
         nonce,
         instruction_data: data,
+        accounts,
     };
 
     let serialized =
@@ -136,37 +155,33 @@ fn create_transaction_message(
 }
 
 pub fn sign_transaction(
+    program_id: PublicKey,
     to_public_key: PublicKey,
     amount: u64,
     instruction_data: Vec<u8>,
     secret_key: &SecretKey,
     fee: u64,
     nonce: u64,
+    accounts: Vec<AccountMeta>,
 ) -> Result<Transaction, TransactionError> {
     let secp = Secp256k1::new();
     let from_public_key = PublicKey::from_secret_key(&secp, secret_key);
 
-    // let instruction_hex = hex::encode(&instruction_data);
-    // let message_to_sign = format!(
-    //     "{}{}{}{}{}{}",
-    //     from_public_key, to_public_key, amount, fee, nonce, instruction_hex
-    // );
     let message = create_transaction_message(
+        &program_id,
         &from_public_key,
         &to_public_key,
         amount,
         fee,
         nonce,
         &instruction_data,
+        &accounts,
     )?;
-
-    // let digest = sha256::Hash::hash(message.as_bytes()).to_byte_array();
-
-    // let message = Message::from_digest(digest);
 
     let signature = secp.sign_ecdsa(message, secret_key);
 
     Ok(Transaction {
+        program_id,
         from: from_public_key,
         to: to_public_key,
         signature,
@@ -174,6 +189,7 @@ pub fn sign_transaction(
         amount,
         fee,
         nonce,
+        accounts,
     })
 }
 
@@ -182,12 +198,14 @@ impl Transaction {
         let secp = Secp256k1::new();
 
         let message = create_transaction_message(
+            &self.program_id,
             &self.from,
             &self.to,
             self.amount,
             self.fee,
             self.nonce,
             &self.instruction_data,
+            &self.accounts,
         )?;
 
         secp.verify_ecdsa(message, &self.signature, &self.from)
@@ -202,6 +220,7 @@ impl Blockchain {
         genesis_pubkey: PublicKey,
         faucet_program_id: PublicKey,
         notebook_program_id: PublicKey,
+        distributor_program_id: PublicKey,
     ) -> Self {
         let timestamp = current_time();
         let difficulty = 2;
@@ -237,6 +256,7 @@ impl Blockchain {
             mempool: vec![],
             faucet_program_id,
             notebook_program_id,
+            distributor_program_id,
             nonces,
         }
     }
@@ -313,6 +333,7 @@ impl Blockchain {
         instruction_data: &[u8],
         caller: &PublicKey,
         _amount: u64,
+        accounts: &[AccountMeta],
     ) {
         if program_id == &self.faucet_program_id {
             if instruction_data == [1] {
@@ -321,6 +342,62 @@ impl Blockchain {
                 }
             } else {
                 println!("Error executing program")
+            }
+        }
+
+        if program_id == &self.distributor_program_id
+            && instruction_data.len() == 24
+            && accounts.len()==4
+        {
+            if let Some(first_account) = accounts.first() {
+                let is_valid = first_account.pubkey == *caller
+                    && first_account.is_signer
+                    && first_account.is_writable;
+
+                if !is_valid {
+                    println!("Error: first acount");
+                    return;
+                }
+            }
+
+            for i in 1..=3 {
+                if !accounts[i].is_writable {
+                    println!("Error: account is not writable");
+                    return;
+                }
+            }
+
+            for account in accounts {
+                if !self.accounts.contains_key(&account.pubkey) {
+                    println!("Error: One or more accounts do not exist");
+                    return;
+                }
+            }
+
+            let sums: Vec<u64> = instruction_data
+                .chunks_exact(8)
+                .take(3)
+                .map(|chunk| {
+                    let array: [u8; 8] = chunk.try_into().expect("Ошибка размера фрагмента");
+                    u64::from_le_bytes(array)
+                })
+                .collect();
+
+            let totals: u64 = sums.iter().sum();
+            if !self.check_balance(caller, totals) {
+                println!("Error: not enough balance");
+                return;
+            }
+
+            let amounts = [sums[0], sums[1], sums[2]];
+            for (receiver, amount) in accounts[1..4].iter().zip(amounts.iter()) {
+                if let Some(acc) = self.accounts.get_mut(&receiver.pubkey) {
+                    acc.coins += amount;
+                }
+            }
+
+            if let Some(acc) = self.accounts.get_mut(&caller) {
+                acc.coins -= totals;
             }
         }
 
@@ -348,7 +425,7 @@ impl Blockchain {
                             );
                         }
 
-                        println!("Owner check passed. Writing data...");
+                        // todo
                         // acc.data = text_bytes.to_vec();
                     } else {
                         println!(
@@ -363,6 +440,18 @@ impl Blockchain {
     }
 
     pub fn apply_transaction(&mut self, tx: &Transaction) -> Result<(), TransferError> {
+        let sender_is_authorized = tx
+            .accounts
+            .iter()
+            .find(|t| t.pubkey == tx.from && t.is_signer && t.is_writable)
+            .ok_or(TransferError::SenderNotWritable)?;
+
+        let receiver_meta = tx
+            .accounts
+            .iter()
+            .find(|a| a.pubkey == tx.to && a.is_writable)
+            .ok_or(TransferError::ReceiverNotWritable)?;
+
         let sender_balance = self
             .accounts
             .get_mut(&tx.from)
@@ -376,12 +465,18 @@ impl Blockchain {
 
         let is_program = self
             .accounts
-            .get(&tx.to)
+            .get(&tx.program_id)
             .map(|a| a.executable)
             .unwrap_or(false);
 
         if is_program {
-            self.execute_program(&tx.to, &tx.instruction_data, &tx.from, tx.amount);
+            self.execute_program(
+                &tx.program_id,
+                &tx.instruction_data,
+                &tx.from,
+                tx.amount,
+                &tx.accounts,
+            );
             return Ok(());
         }
 
@@ -642,9 +737,21 @@ async fn sync_with_peer(addr: &str, chain: Arc<Mutex<Blockchain>>) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (_, faucet_program_id) = generate_keypair();
     let (_, notebook_program_id) = generate_keypair();
+    let (_, distributor_program_id) = generate_keypair();
     let (secret_key_from, public_key_from) = generate_keypair();
     let (_, public_key_to) = generate_keypair();
-    let mut tx = sign_transaction(public_key_to, 100, vec![], &secret_key_from, 0, 0).unwrap();
+    let (_, dummy_program_1) = generate_keypair();
+    let mut tx = sign_transaction(
+        dummy_program_1,
+        public_key_to,
+        100,
+        vec![],
+        &secret_key_from,
+        0,
+        0,
+        vec![],
+    )
+    .unwrap();
 
     println!("valid = {:?}", tx.verify_transaction());
     tx.amount = 101;
@@ -661,14 +768,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         public_key_from,
         faucet_program_id,
         notebook_program_id,
+        distributor_program_id,
     )));
 
     if server_port == 8080 {
-        let tx1 = sign_transaction(public_key_to, 101, vec![], &secret_key_from, 0, 0).unwrap();
+        let tx1 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            101,
+            vec![],
+            &secret_key_from,
+            0,
+            0,
+            vec![],
+        )
+        .unwrap();
         println!("valid = {:?}", tx1.verify_transaction());
-        let tx2 = sign_transaction(public_key_to, 102, vec![], &secret_key_from, 0, 1).unwrap();
+        let tx2 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            102,
+            vec![],
+            &secret_key_from,
+            0,
+            1,
+            vec![],
+        )
+        .unwrap();
         println!("valid = {:?}", tx2.verify_transaction());
-        let tx3 = sign_transaction(public_key_to, 103, vec![], &secret_key_from, 0, 2).unwrap();
+        let tx3 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            103,
+            vec![],
+            &secret_key_from,
+            0,
+            2,
+            vec![],
+        )
+        .unwrap();
         println!("valid = {:?}", tx3.verify_transaction());
         let mut lock = chain.lock().await;
         let _ = lock.add_to_mempool(tx1);
@@ -758,6 +896,7 @@ mod tests {
                 mempool: vec![],
                 faucet_program_id,
                 notebook_program_id,
+                distributor_program_id: faucet_program_id,
                 nonces: HashMap::new(),
             };
 
@@ -776,7 +915,18 @@ mod tests {
             ));
             let (secret_key_from, _) = generate_keypair();
             let (_, public_key_to) = generate_keypair();
-            let tx = sign_transaction(public_key_to, 200, vec![], &secret_key_from, 0, 0).unwrap();
+            let (_, dummy_program_1) = generate_keypair();
+            let tx = sign_transaction(
+                dummy_program_1,
+                public_key_to,
+                200,
+                vec![],
+                &secret_key_from,
+                0,
+                0,
+                vec![],
+            )
+            .unwrap();
             println!("valid = {:?}", tx.verify_transaction());
             let _ = bc.add_to_mempool(tx);
 
@@ -806,8 +956,18 @@ mod tests {
 
         let (_, to_public_key) = secp.generate_keypair(&mut rand::rng());
 
-        let mut transaction =
-            sign_transaction(to_public_key, 100, vec![], &from_secret_key, 0, 0).unwrap();
+        let (_, dummy_program_1) = generate_keypair();
+        let mut transaction = sign_transaction(
+            dummy_program_1,
+            to_public_key,
+            100,
+            vec![],
+            &from_secret_key,
+            0,
+            0,
+            vec![],
+        )
+        .unwrap();
 
         let is_valid = transaction.verify_transaction().is_ok();
         assert!(is_valid);
@@ -860,12 +1020,56 @@ mod tests {
         let (secret_key_from, public_key_from) = generate_keypair();
         let (_, public_key_to) = generate_keypair();
         let (_, miner_pubkey) = generate_keypair();
+        let (_, dummy_program_1) = generate_keypair();
 
-        let tx1 = sign_transaction(public_key_to, 101, vec![], &secret_key_from, 0, 0).unwrap();
+        let transaction_accounts = vec![
+            AccountMeta {
+                pubkey: public_key_from,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: public_key_to,
+                is_signer: false,
+                is_writable: true,
+            },
+        ];
+
+        let tx1 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            101,
+            vec![],
+            &secret_key_from,
+            0,
+            0,
+            transaction_accounts.clone(),
+        )
+        .unwrap();
         println!("valid 1 = {:?}", tx1.verify_transaction());
-        let tx2 = sign_transaction(public_key_to, 102, vec![], &secret_key_from, 0, 1).unwrap();
+        let tx2 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            102,
+            vec![],
+            &secret_key_from,
+            0,
+            1,
+            transaction_accounts.clone(),
+        )
+        .unwrap();
         println!("valid 2 = {:?}", tx2.verify_transaction());
-        let mut tx3 = sign_transaction(public_key_to, 103, vec![], &secret_key_from, 0, 2).unwrap();
+        let mut tx3 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            103,
+            vec![],
+            &secret_key_from,
+            0,
+            2,
+            transaction_accounts,
+        )
+        .unwrap();
         tx3.amount = 999;
         println!("valid 3 = {:?}", tx3.verify_transaction());
 
@@ -898,6 +1102,7 @@ mod tests {
             mempool: vec![],
             faucet_program_id,
             notebook_program_id,
+            distributor_program_id: faucet_program_id,
             nonces: HashMap::new(),
         };
 
@@ -932,10 +1137,45 @@ mod tests {
         let (secret_key_from, public_key_from) = generate_keypair();
         let (_, public_key_to) = generate_keypair();
         let (_, miner_pubkey) = generate_keypair();
+        let (_, dummy_program_1) = generate_keypair();
 
-        let tx1 = sign_transaction(public_key_to, 50, vec![], &secret_key_from, 0, 0).unwrap();
+        let tx_accounts = vec![
+            AccountMeta {
+                pubkey: public_key_from,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: public_key_to,
+                is_signer: false,
+                is_writable: true,
+            },
+        ];
+
+        let tx1 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            50,
+            vec![],
+            &secret_key_from,
+            0,
+            0,
+            tx_accounts.clone(),
+        )
+        .unwrap();
         println!("valid 1 = {:?}", tx1.verify_transaction());
-        let tx2 = sign_transaction(public_key_to, 200, vec![], &secret_key_from, 0, 1).unwrap();
+
+        let tx2 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            200,
+            vec![],
+            &secret_key_from,
+            0,
+            1,
+            tx_accounts,
+        )
+        .unwrap();
         println!("valid 2 = {:?}", tx2.verify_transaction());
 
         let diff = 4;
@@ -967,6 +1207,7 @@ mod tests {
             mempool: vec![],
             faucet_program_id,
             notebook_program_id,
+            distributor_program_id: faucet_program_id,
             nonces: HashMap::new(),
         };
 
@@ -1007,7 +1248,7 @@ mod tests {
         let (_, notebook_program_id) = generate_keypair();
         let (_, faucet_program_id) = generate_keypair();
         let (secret_key_from, public_key_from) = generate_keypair();
-        let (_, miner_pubkey) = generate_keypair(); 
+        let (_, miner_pubkey) = generate_keypair();
 
         let diff = 4;
 
@@ -1029,12 +1270,36 @@ mod tests {
             mempool: vec![],
             faucet_program_id,
             notebook_program_id,
+            distributor_program_id: faucet_program_id,
             nonces: HashMap::new(),
         };
 
         bc.deploy_program(faucet_program_id, vec![]);
 
-        let tx1 = sign_transaction(faucet_program_id, 0, vec![1], &secret_key_from, 0, 0).unwrap();
+        let transaction_accounts = vec![
+            AccountMeta {
+                pubkey: public_key_from,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: faucet_program_id,
+                is_signer: false,
+                is_writable: true,
+            },
+        ];
+
+        let tx1 = sign_transaction(
+            faucet_program_id,
+            faucet_program_id,
+            0,
+            vec![1],
+            &secret_key_from,
+            0,
+            0,
+            transaction_accounts,
+        )
+        .unwrap();
         println!("valid 1 = {:?}", tx1.verify_transaction());
         assert!(bc.add_to_mempool(tx1).is_ok());
         assert!(bc.add_block(miner_pubkey).is_ok());
@@ -1075,6 +1340,7 @@ mod tests {
             mempool: vec![],
             faucet_program_id,
             notebook_program_id,
+            distributor_program_id: faucet_program_id,
             nonces: HashMap::new(),
         };
 
@@ -1086,7 +1352,30 @@ mod tests {
         data.extend_from_slice(&public_key_from.serialize());
         data.extend_from_slice(b"Hello Solana!"); // Текст
 
-        let tx1 = sign_transaction(notebook_program_id, 0, data, &secret_key_from, 0, 0).unwrap();
+        let transaction_accounts = vec![
+            AccountMeta {
+                pubkey: public_key_from,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: notebook_program_id,
+                is_signer: false,
+                is_writable: true,
+            },
+        ];
+
+        let tx1 = sign_transaction(
+            notebook_program_id,
+            notebook_program_id,
+            0,
+            data,
+            &secret_key_from,
+            0,
+            0,
+            transaction_accounts,
+        )
+        .unwrap();
         println!("valid 1 = {:?}", tx1.verify_transaction());
         assert!(bc.add_to_mempool(tx1).is_ok());
         assert!(bc.add_block(miner_pubkey).is_ok());
@@ -1110,6 +1399,7 @@ mod tests {
         let (_, victim_key) = generate_keypair();
         let (_, miner_pubkey) = generate_keypair();
 
+        let (_, dummy_program_1) = generate_keypair();
         let diff = 4;
 
         let mut accounts = HashMap::new();
@@ -1139,6 +1429,7 @@ mod tests {
             mempool: vec![],
             faucet_program_id,
             notebook_program_id,
+            distributor_program_id: faucet_program_id,
             nonces: HashMap::new(),
         };
 
@@ -1149,7 +1440,30 @@ mod tests {
         data.extend_from_slice(&victim_key.serialize()); // 33 байта адреса
         data.extend_from_slice(b"Hello Solana!"); // Текст
 
-        let tx1 = sign_transaction(notebook_program_id, 0, data, &secret_key_from, 0, 0).unwrap();
+        let transaction_accounts = vec![
+            AccountMeta {
+                pubkey: public_key_from,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: notebook_program_id,
+                is_signer: false,
+                is_writable: true,
+            },
+        ];
+
+        let tx1 = sign_transaction(
+            dummy_program_1,
+            notebook_program_id,
+            0,
+            data,
+            &secret_key_from,
+            0,
+            0,
+            transaction_accounts,
+        )
+        .unwrap();
         println!("valid 1 = {:?}", tx1.verify_transaction());
         assert!(bc.add_to_mempool(tx1).is_ok());
         assert!(bc.add_block(miner_pubkey).is_ok());
@@ -1168,7 +1482,12 @@ mod tests {
         let (_, notebook_program_id) = generate_keypair();
         let (_, genesis_pubkey) = generate_keypair();
 
-        let bc = Blockchain::new(genesis_pubkey, faucet_program_id, notebook_program_id);
+        let bc = Blockchain::new(
+            genesis_pubkey,
+            faucet_program_id,
+            notebook_program_id,
+            faucet_program_id,
+        );
 
         // Genesis аккаунт должен иметь nonce = 0 после создания блокчейна
         let genesis_nonce = bc.nonces.get(&genesis_pubkey);
@@ -1195,12 +1514,56 @@ mod tests {
         let (secret_key_from, public_key_from) = generate_keypair();
         let (_, public_key_to) = generate_keypair();
         let (_, miner_pubkey) = generate_keypair();
+        let (_, dummy_program_1) = generate_keypair();
 
-        let tx1 = sign_transaction(public_key_to, 25, vec![], &secret_key_from, 30, 0).unwrap();
+        let transaction_accounts = vec![
+            AccountMeta {
+                pubkey: public_key_from,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: public_key_to,
+                is_signer: false,
+                is_writable: true,
+            },
+        ];
+
+        let tx1 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            25,
+            vec![],
+            &secret_key_from,
+            30,
+            0,
+            transaction_accounts.clone(),
+        )
+        .unwrap();
         println!("valid 1 = {:?}", tx1.verify_transaction());
-        let tx2 = sign_transaction(public_key_to, 20, vec![], &secret_key_from, 10, 1).unwrap();
+        let tx2 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            20,
+            vec![],
+            &secret_key_from,
+            10,
+            1,
+            transaction_accounts.clone(),
+        )
+        .unwrap();
         println!("valid 2 = {:?}", tx2.verify_transaction());
-        let tx3 = sign_transaction(public_key_to, 15, vec![], &secret_key_from, 50, 2).unwrap();
+        let tx3 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            15,
+            vec![],
+            &secret_key_from,
+            50,
+            2,
+            transaction_accounts,
+        )
+        .unwrap();
         println!("valid 3 = {:?}", tx3.verify_transaction());
 
         let diff = 4;
@@ -1232,6 +1595,7 @@ mod tests {
             mempool: vec![],
             faucet_program_id,
             notebook_program_id,
+            distributor_program_id: faucet_program_id,
             nonces: HashMap::new(),
         };
 
@@ -1273,10 +1637,44 @@ mod tests {
         let (secret_key_from, public_key_from) = generate_keypair();
         let (_, public_key_to) = generate_keypair();
         let (_, miner_pubkey) = generate_keypair();
+        let (_, dummy_program_1) = generate_keypair();
 
-        let tx1 = sign_transaction(public_key_to, 25, vec![], &secret_key_from, 20, 0).unwrap();
+        let transaction_accounts = vec![
+            AccountMeta {
+                pubkey: public_key_from,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: public_key_to,
+                is_signer: false,
+                is_writable: true,
+            },
+        ];
+
+        let tx1 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            25,
+            vec![],
+            &secret_key_from,
+            20,
+            0,
+            transaction_accounts.clone(),
+        )
+        .unwrap();
         println!("valid 1 = {:?}", tx1.verify_transaction());
-        let tx2 = sign_transaction(public_key_to, 20, vec![], &secret_key_from, 10, 1).unwrap();
+        let tx2 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            20,
+            vec![],
+            &secret_key_from,
+            10,
+            1,
+            transaction_accounts,
+        )
+        .unwrap();
         println!("valid 2 = {:?}", tx2.verify_transaction());
 
         let diff = 4;
@@ -1310,6 +1708,7 @@ mod tests {
             mempool: vec![],
             faucet_program_id,
             notebook_program_id,
+            distributor_program_id: faucet_program_id,
             nonces,
         };
 
@@ -1340,5 +1739,684 @@ mod tests {
             bc.accounts.get(&miner_pubkey).unwrap().coins,
             BLOCK_REWARD + 30
         );
+    }
+
+    #[test]
+    fn test_apply_without_sender_in_accounts() {
+        let (_, notebook_program_id) = generate_keypair();
+        let (_, faucet_program_id) = generate_keypair();
+        let (secret_key_from, public_key_from) = generate_keypair();
+        let (_, public_key_to) = generate_keypair();
+        let (_, dummy_program_1) = generate_keypair();
+
+        let diff = 4;
+
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            public_key_from,
+            Account {
+                coins: 1000,
+                data: vec![],
+                owner: public_key_from,
+                executable: false,
+            },
+        );
+
+        let mut bc = Blockchain {
+            accounts: accounts,
+            difficulty: diff,
+            vec: vec![],
+            mempool: vec![],
+            faucet_program_id,
+            notebook_program_id,
+            distributor_program_id: faucet_program_id,
+            nonces: HashMap::new(),
+        };
+
+        let transaction_accounts = vec![AccountMeta {
+            pubkey: public_key_to,
+            is_signer: false,
+            is_writable: true,
+        }];
+
+        let tx1 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            50,
+            vec![],
+            &secret_key_from,
+            0,
+            0,
+            transaction_accounts,
+        )
+        .unwrap();
+
+        let result = bc.apply_transaction(&tx1);
+
+        println!("{:?}", result);
+        assert_eq!(result, Err(TransferError::SenderNotWritable));
+        assert_eq!(bc.accounts.get(&public_key_from).unwrap().coins, 1000);
+    }
+
+    #[test]
+    fn test_apply_without_receiver_in_accounts() {
+        let (_, notebook_program_id) = generate_keypair();
+        let (_, faucet_program_id) = generate_keypair();
+        let (secret_key_from, public_key_from) = generate_keypair();
+        let (_, public_key_to) = generate_keypair();
+        let (_, dummy_program_1) = generate_keypair();
+
+        let diff = 4;
+
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            public_key_from,
+            Account {
+                coins: 1000,
+                data: vec![],
+                owner: public_key_from,
+                executable: false,
+            },
+        );
+
+        accounts.insert(
+            public_key_to,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: public_key_to,
+                executable: false,
+            },
+        );
+
+        let mut bc = Blockchain {
+            accounts,
+            difficulty: diff,
+            vec: vec![],
+            mempool: vec![],
+            faucet_program_id,
+            notebook_program_id,
+            distributor_program_id: faucet_program_id,
+            nonces: HashMap::new(),
+        };
+
+        // В списке accounts есть только Вася.
+        // Петя, которому переводятся деньги, отсутствует.
+        let transaction_accounts = vec![AccountMeta {
+            pubkey: public_key_from,
+            is_signer: true,
+            is_writable: true,
+        }];
+
+        let tx1 = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            50,
+            vec![],
+            &secret_key_from,
+            0,
+            0,
+            transaction_accounts,
+        )
+        .unwrap();
+
+        let result = bc.apply_transaction(&tx1);
+        println!("{:?}", result);
+
+        assert_eq!(result, Err(TransferError::ReceiverNotWritable));
+
+        assert_eq!(bc.accounts.get(&public_key_from).unwrap().coins, 1000);
+
+        assert_eq!(bc.accounts.get(&public_key_to).unwrap().coins, 0);
+    }
+
+    #[test]
+    fn test_simple_transfer_with_accounts_list() {
+        let (secret_key_from, public_key_from) = generate_keypair();
+        let (_, public_key_to) = generate_keypair();
+
+        let (_, dummy_program_1) = generate_keypair();
+        let (_, dummy_program_2) = generate_keypair();
+
+        let mut accounts_db = HashMap::new();
+        accounts_db.insert(
+            public_key_from,
+            Account {
+                coins: 1000,
+                data: vec![],
+                owner: public_key_from,
+                executable: false,
+            },
+        );
+        // У Пети пока нет аккаунта в базе!
+
+        let mut bc = Blockchain {
+            accounts: accounts_db,
+            difficulty: 2,
+            vec: vec![],
+            mempool: vec![],
+            faucet_program_id: dummy_program_1,
+            notebook_program_id: dummy_program_2,
+            distributor_program_id: dummy_program_1,
+            nonces: HashMap::new(),
+        };
+
+        // 1. СОЗДАЕМ СПИСОК УЧАСТНИКОВ (Manifest)
+        // Мы явно говорим блокчейну: "В этой транзакции будут затронуты эти два аккаунта, и оба можно менять"
+        let tx_accounts = vec![
+            AccountMeta {
+                pubkey: public_key_from,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: public_key_to,
+                is_signer: false,
+                is_writable: true,
+            }, // Петя не подписывает, он просто получает
+        ];
+
+        // 2. Создаем транзакцию
+        let tx = sign_transaction(
+            dummy_program_1,
+            public_key_to,
+            100,
+            vec![],
+            &secret_key_from,
+            0,
+            0,
+            tx_accounts,
+        )
+        .unwrap();
+
+        // 3. ИСПОЛНЯЕМ
+        let result = bc.apply_transaction(&tx);
+        println!("{:?}", result);
+        // 4. ПРОВЕРЯЕМ
+        assert!(result.is_ok(), "Транзакция должна пройти успешно");
+        assert_eq!(bc.accounts.get(&public_key_from).unwrap().coins, 900); // Списали 100
+        assert_eq!(bc.accounts.get(&public_key_to).unwrap().coins, 100); // Начислили 100 (аккаунт создался)
+    }
+
+    #[test]
+    fn test_distributor_program() {
+        let (_, notebook_program_id) = generate_keypair();
+        let (_, faucet_program_id) = generate_keypair();
+        let (_, distributor_program_id) = generate_keypair();
+
+        // 1. Генерация ключей
+        let (vasya_sk, vasya_pk) = generate_keypair();
+        let (_, petya_pk) = generate_keypair();
+        let (_, sasha_pk) = generate_keypair();
+        let (_, masha_pk) = generate_keypair();
+
+        let (_, dummy_program_1) = generate_keypair();
+        let (_, dummy_program_2) = generate_keypair();
+
+        // 2. Создаём блокчейн
+        let mut accounts_db = HashMap::new();
+        accounts_db.insert(
+            vasya_pk,
+            Account {
+                coins: 1000,
+                data: vec![],
+                owner: vasya_pk,
+                executable: false,
+            },
+        );
+        accounts_db.insert(
+            petya_pk,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: petya_pk,
+                executable: false,
+            },
+        );
+        accounts_db.insert(
+            sasha_pk,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: sasha_pk,
+                executable: false,
+            },
+        );
+        accounts_db.insert(
+            masha_pk,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: masha_pk,
+                executable: false,
+            },
+        );
+
+        let mut bc = Blockchain {
+            accounts: accounts_db,
+            difficulty: 2,
+            vec: vec![],
+            mempool: vec![],
+            faucet_program_id: dummy_program_1,
+            notebook_program_id: dummy_program_2,
+            distributor_program_id,
+            nonces: HashMap::new(),
+        };
+
+        bc.deploy_program(distributor_program_id, vec![]);
+
+        // 3. Формируем список аккаунтов
+        let tx_accounts = vec![
+            AccountMeta {
+                pubkey: vasya_pk,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: petya_pk,
+                is_signer: false,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: sasha_pk,
+                is_signer: false,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: masha_pk,
+                is_signer: false,
+                is_writable: true,
+            },
+        ];
+
+        // 4. Формируем instruction_data: [30, 20, 50]
+        // Нужно закодировать три числа u64 в байты
+        let mut instruction_data = vec![];
+        instruction_data.extend_from_slice(&30u64.to_le_bytes());
+        instruction_data.extend_from_slice(&20u64.to_le_bytes());
+        instruction_data.extend_from_slice(&50u64.to_le_bytes());
+
+        // 5. Создаём транзакцию
+        let tx = sign_transaction(
+            distributor_program_id,
+            vasya_pk,
+            0,
+            instruction_data,
+            &vasya_sk,
+            0,
+            0,
+            tx_accounts,
+        )
+        .unwrap();
+
+        // 6. ИСПОЛНЯЕМ
+        let result = bc.apply_transaction(&tx);
+        assert!(result.is_ok(), "Транзакция должна пройти: {:?}", result);
+
+        // 7. ПРОВЕРЯЕМ РАСПРЕДЕЛЕНИЕ
+        assert_eq!(bc.accounts.get(&vasya_pk).unwrap().coins, 900); // 1000 - 100
+        assert_eq!(bc.accounts.get(&petya_pk).unwrap().coins, 30);
+        assert_eq!(bc.accounts.get(&sasha_pk).unwrap().coins, 20);
+        assert_eq!(bc.accounts.get(&masha_pk).unwrap().coins, 50);
+    }
+
+    #[test]
+    fn test_distributor_insufficient_funds_is_atomic() {
+        let (_, notebook_program_id) = generate_keypair();
+        let (_, faucet_program_id) = generate_keypair();
+        let (_, distributor_program_id) = generate_keypair();
+
+        // 1. Генерация ключей
+        let (vasya_sk, vasya_pk) = generate_keypair();
+        let (_, petya_pk) = generate_keypair();
+        let (_, sasha_pk) = generate_keypair();
+        let (_, masha_pk) = generate_keypair();
+
+        let (_, dummy_program_1) = generate_keypair();
+        let (_, dummy_program_2) = generate_keypair();
+
+        // 2. Создаём блокчейн
+        let mut accounts_db = HashMap::new();
+        accounts_db.insert(
+            vasya_pk,
+            Account {
+                coins: 99,
+                data: vec![],
+                owner: vasya_pk,
+                executable: false,
+            },
+        );
+        accounts_db.insert(
+            petya_pk,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: petya_pk,
+                executable: false,
+            },
+        );
+        accounts_db.insert(
+            sasha_pk,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: sasha_pk,
+                executable: false,
+            },
+        );
+        accounts_db.insert(
+            masha_pk,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: masha_pk,
+                executable: false,
+            },
+        );
+
+        let mut bc = Blockchain {
+            accounts: accounts_db,
+            difficulty: 2,
+            vec: vec![],
+            mempool: vec![],
+            faucet_program_id: dummy_program_1,
+            notebook_program_id: dummy_program_2,
+            distributor_program_id,
+            nonces: HashMap::new(),
+        };
+
+        bc.deploy_program(distributor_program_id, vec![]);
+
+        // 3. Формируем список аккаунтов
+        let tx_accounts = vec![
+            AccountMeta {
+                pubkey: vasya_pk,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: petya_pk,
+                is_signer: false,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: sasha_pk,
+                is_signer: false,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: masha_pk,
+                is_signer: false,
+                is_writable: true,
+            },
+        ];
+
+        // 4. Формируем instruction_data: [30, 20, 50]
+        // Нужно закодировать три числа u64 в байты
+        let mut instruction_data = vec![];
+        instruction_data.extend_from_slice(&30u64.to_le_bytes());
+        instruction_data.extend_from_slice(&20u64.to_le_bytes());
+        instruction_data.extend_from_slice(&50u64.to_le_bytes());
+
+        // 5. Создаём транзакцию
+        let tx = sign_transaction(
+            distributor_program_id,
+            vasya_pk,
+            0,
+            instruction_data,
+            &vasya_sk,
+            0,
+            0,
+            tx_accounts,
+        )
+        .unwrap();
+
+        // 6. ИСПОЛНЯЕМ
+        let result = bc.apply_transaction(&tx);
+
+        assert_eq!(bc.accounts.get(&vasya_pk).unwrap().coins, 99);
+        assert_eq!(bc.accounts.get(&petya_pk).unwrap().coins, 0);
+        assert_eq!(bc.accounts.get(&sasha_pk).unwrap().coins, 0);
+        assert_eq!(bc.accounts.get(&masha_pk).unwrap().coins, 0);
+    }
+
+
+    #[test]
+    fn test_distributor_requires_four_accounts() {
+        let (_, distributor_program_id) = generate_keypair();
+
+        // 1. Генерация ключей
+        let (vasya_sk, vasya_pk) = generate_keypair();
+        let (_, petya_pk) = generate_keypair();
+        let (_, sasha_pk) = generate_keypair();
+        let (_, masha_pk) = generate_keypair();
+
+        let (_, dummy_program_1) = generate_keypair();
+        let (_, dummy_program_2) = generate_keypair();
+
+        // 2. Создаём блокчейн
+        let mut accounts_db = HashMap::new();
+        accounts_db.insert(
+            vasya_pk,
+            Account {
+                coins: 99,
+                data: vec![],
+                owner: vasya_pk,
+                executable: false,
+            },
+        );
+        accounts_db.insert(
+            petya_pk,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: petya_pk,
+                executable: false,
+            },
+        );
+        accounts_db.insert(
+            sasha_pk,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: sasha_pk,
+                executable: false,
+            },
+        );
+        accounts_db.insert(
+            masha_pk,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: masha_pk,
+                executable: false,
+            },
+        );
+
+        let mut bc = Blockchain {
+            accounts: accounts_db,
+            difficulty: 2,
+            vec: vec![],
+            mempool: vec![],
+            faucet_program_id: dummy_program_1,
+            notebook_program_id: dummy_program_2,
+            distributor_program_id,
+            nonces: HashMap::new(),
+        };
+
+        bc.deploy_program(distributor_program_id, vec![]);
+
+        // 3. Формируем список аккаунтов
+        let tx_accounts = vec![
+            AccountMeta {
+                pubkey: vasya_pk,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: petya_pk,
+                is_signer: false,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: sasha_pk,
+                is_signer: false,
+                is_writable: true,
+            },
+            // AccountMeta {
+            //     pubkey: masha_pk,
+            //     is_signer: false,
+            //     is_writable: true,
+            // },
+        ];
+
+        // 4. Формируем instruction_data: [30, 20, 50]
+        // Нужно закодировать три числа u64 в байты
+        let mut instruction_data = vec![];
+        instruction_data.extend_from_slice(&30u64.to_le_bytes());
+        instruction_data.extend_from_slice(&20u64.to_le_bytes());
+        instruction_data.extend_from_slice(&50u64.to_le_bytes());
+
+        // 5. Создаём транзакцию
+        let tx = sign_transaction(
+            distributor_program_id,
+            vasya_pk,
+            0,
+            instruction_data,
+            &vasya_sk,
+            0,
+            0,
+            tx_accounts,
+        )
+        .unwrap();
+
+        // 6. ИСПОЛНЯЕМ
+        let result = bc.apply_transaction(&tx);
+
+        assert_eq!(bc.accounts.get(&vasya_pk).unwrap().coins, 99);
+        assert_eq!(bc.accounts.get(&petya_pk).unwrap().coins, 0);
+        assert_eq!(bc.accounts.get(&sasha_pk).unwrap().coins, 0);
+        assert_eq!(bc.accounts.get(&masha_pk).unwrap().coins, 0);
+    }
+
+
+
+    #[test]
+    fn test_distributor_rejects_readonly_receiver() {
+        let (_, distributor_program_id) = generate_keypair();
+
+        // 1. Генерация ключей
+        let (vasya_sk, vasya_pk) = generate_keypair();
+        let (_, petya_pk) = generate_keypair();
+        let (_, sasha_pk) = generate_keypair();
+        let (_, masha_pk) = generate_keypair();
+
+        let (_, dummy_program_1) = generate_keypair();
+        let (_, dummy_program_2) = generate_keypair();
+
+        // 2. Создаём блокчейн
+        let mut accounts_db = HashMap::new();
+        accounts_db.insert(
+            vasya_pk,
+            Account {
+                coins: 1000,
+                data: vec![],
+                owner: vasya_pk,
+                executable: false,
+            },
+        );
+        accounts_db.insert(
+            petya_pk,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: petya_pk,
+                executable: false,
+            },
+        );
+        accounts_db.insert(
+            sasha_pk,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: sasha_pk,
+                executable: false,
+            },
+        );
+        accounts_db.insert(
+            masha_pk,
+            Account {
+                coins: 0,
+                data: vec![],
+                owner: masha_pk,
+                executable: false,
+            },
+        );
+
+        let mut bc = Blockchain {
+            accounts: accounts_db,
+            difficulty: 2,
+            vec: vec![],
+            mempool: vec![],
+            faucet_program_id: dummy_program_1,
+            notebook_program_id: dummy_program_2,
+            distributor_program_id,
+            nonces: HashMap::new(),
+        };
+
+        bc.deploy_program(distributor_program_id, vec![]);
+
+        // 3. Формируем список аккаунтов
+        let tx_accounts = vec![
+            AccountMeta {
+                pubkey: vasya_pk,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: petya_pk,
+                is_signer: false,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: sasha_pk,
+                is_signer: false,
+                is_writable: false,
+            },
+            AccountMeta {
+                pubkey: masha_pk,
+                is_signer: false,
+                is_writable: true,
+            },
+        ];
+
+        // 4. Формируем instruction_data: [30, 20, 50]
+        // Нужно закодировать три числа u64 в байты
+        let mut instruction_data = vec![];
+        instruction_data.extend_from_slice(&30u64.to_le_bytes());
+        instruction_data.extend_from_slice(&20u64.to_le_bytes());
+        instruction_data.extend_from_slice(&50u64.to_le_bytes());
+
+        // 5. Создаём транзакцию
+        let tx = sign_transaction(
+            distributor_program_id,
+            vasya_pk,
+            0,
+            instruction_data,
+            &vasya_sk,
+            0,
+            0,
+            tx_accounts,
+        )
+        .unwrap();
+
+        // 6. ИСПОЛНЯЕМ
+        let result = bc.apply_transaction(&tx);
+        assert!(result.is_ok(), "Транзакция должна пройти: {:?}", result);
+
+        assert_eq!(bc.accounts.get(&vasya_pk).unwrap().coins, 1000);
+        assert_eq!(bc.accounts.get(&petya_pk).unwrap().coins, 0);
+        assert_eq!(bc.accounts.get(&sasha_pk).unwrap().coins, 0);
+        assert_eq!(bc.accounts.get(&masha_pk).unwrap().coins, 0);
     }
 }
